@@ -1,0 +1,570 @@
+library(tidyverse)
+library(naniar)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(survey)
+library(rafalib)
+library(modelr)
+library(na.tools)
+library(ggimage)
+library(ggrepel)
+library(remotes)
+library(glue)
+
+first <- 2009 # first season to grab. min available=2009
+last <- 2018 # most recent season as of creation of project
+datalist = list()
+for (yr in first:last) {
+  pbp <- read_csv(url(paste0("https://github.com/ryurko/nflscrapR-data/raw/master/play_by_play_data/regular_season/reg_pbp_", yr, ".csv")))
+  games <- read_csv(url(paste0("https://raw.githubusercontent.com/ryurko/nflscrapR-data/master/games_data/regular_season/reg_games_", yr, ".csv")))
+  pbp <- pbp %>% inner_join(games %>% distinct(game_id, week, season)) %>% select(-c(fumble_recovery_2_yards, blocked_player_id, fumble_recovery_2_player_id))
+  datalist[[yr]] <- pbp # add it to your list
+}
+pbp_all <- dplyr::bind_rows(datalist)
+## Had to remove the columns that were logical instead of character
+
+pbp_all %>% group_by(home_team) %>%summarize(n=n(), seasons=n_distinct(season), minyr=min(season), maxyr=max(season)) %>% 
+  arrange(seasons)
+## Not specifically relevant to 4th down project
+
+pbp_all <- pbp_all %>% 
+  mutate_at(vars(home_team, away_team, posteam, defteam), funs(case_when(
+    . %in% "JAX" ~ "JAC",
+    . %in% "STL" ~ "LA",
+    . %in% "SD" ~ "LAC",
+    TRUE ~ .
+  ))) 
+
+pbp_all$play_id <- 1:nrow(pbp_all)
+
+
+pbp_all_RunPassOnly_WithNames <- pbp_all %>%
+  filter(!is_na(epa), !is_na(posteam), play_type=="no_play" | play_type=="pass" | play_type=="run") %>%
+  mutate(
+    pass = if_else(str_detect(desc, "(pass)|(sacked)|(scramble)"), 1, 0),
+    rush = if_else(str_detect(desc, "(left end)|(left tackle)|(left guard)|(up the middle)|(right guard)|(right tackle)|(right end)") & pass == 0, 1, 0),
+    success = ifelse(epa>0, 1 , 0),
+    passer_player_name = ifelse(play_type == "no_play" & pass == 1, 
+                                str_extract(desc, "(?<=\\s)[A-Z][a-z]*\\.\\s?[A-Z][A-z]+(\\s(I{2,3})|(IV))?(?=\\s((pass)|(sack)|(scramble)))"),
+                                passer_player_name),
+    receiver_player_name = ifelse(play_type == "no_play" & str_detect(desc, "pass"), 
+                                  str_extract(desc, "(?<=to\\s)[A-Z][a-z]*\\.\\s?[A-Z][A-z]+(\\s(I{2,3})|(IV))?"),
+                                  receiver_player_name),
+    rusher_player_name = ifelse(play_type == "no_play" & rush == 1, 
+                                str_extract(desc, "(?<=\\s)[A-Z][a-z]*\\.\\s?[A-Z][A-z]+(\\s(I{2,3})|(IV))?(?=\\s((left end)|(left tackle)|(left guard)|		      (up the middle)|(right guard)|(right tackle)|(right end)))"),
+                                rusher_player_name),
+    name = ifelse(!is_na(passer_player_name), passer_player_name, rusher_player_name),
+    yards_gained=ifelse(play_type=="no_play",NA,yards_gained),
+    play=1
+  ) %>%
+  filter(pass==1 | rush==1)
+
+pbp_all_NoSpecials <- pbp_all %>% 
+  filter(!is_na(epa), play_type=="no_play" | play_type=="pass" | play_type=="run")
+## NOTE: this still includes timeouts, which are under no_play
+
+pbp_all_NoSpecials <- pbp_all_NoSpecials %>% mutate(
+  pass = if_else(str_detect(desc, "(pass)|(sacked)|(scramble)"), 1, 0),
+  rush = if_else(str_detect(desc, "(left end)|(left tackle)|(left guard)|(up the middle)|(right guard)|(right tackle)|(right end)") & pass == 0, 1, 0),
+  success = ifelse(epa>0, 1 , 0)
+) 
+## This still includes timeouts. Rush does NOT include broken plays,
+## like fake field goals gone wrong
+
+BrokenPlays <- pbp_all_NoSpecials %>% 
+  filter(pass == 0, rush == 0) %>% filter(!play_type == "no_play")
+BrokenPlaysVec <- BrokenPlays$play_id
+
+## First, remove all broken plays, they screw up group_by tables
+pbp_all_NoSpecials <- pbp_all_NoSpecials %>% 
+  filter(!play_id %in% BrokenPlaysVec)
+
+## Filter all fourth downs (stratify by distance eventually)
+pbp_all_NoSpecials_4thDown <- pbp_all_NoSpecials %>% 
+  filter(fourth_down_converted == 1 | fourth_down_failed == 1)
+
+# See if big plays are more likely after timeout (useful later)
+BigPlays <- pbp_all_NoSpecials_4thDown %>% 
+  filter(pass_touchdown == 1 | rush_touchdown == 1 | (yards_gained >= 10 & fourth_down_converted == 1) )
+BigPlayVec <- BigPlays$play_id
+
+pbp_all_NoSpecials_4thDown <- pbp_all_NoSpecials_4thDown %>%
+  mutate(BigPlay = ifelse(play_id %in% BigPlayVec, 1, 0) )
+
+## Filter out all timeouts, turn those indices into vector
+pbp_all_NoSpecials_Timeouts <- pbp_all_NoSpecials %>% 
+  filter(timeout == 1)
+pbp_all_Timeouts_Vector <- pbp_all_NoSpecials_Timeouts$play_id
+pbp_all_Timeouts_Vector
+
+## Add 1 to all terms of that vector, filter those plays
+pbp_all_Timeouts_Vector_PLUSONE <- pbp_all_Timeouts_Vector + 1
+pbp_all_Timeouts_Vector_PLUSONE
+pbp_all_NoSpecials_PlaysFollowingTimeout <- pbp_all_NoSpecials %>% 
+  filter(play_id %in% pbp_all_Timeouts_Vector_PLUSONE)
+
+## Filter the fourth downs out of those post-timeout plays
+pbp_all_NoSpecials_4thDownPlaysFollowingTimeout <- 
+  pbp_all_NoSpecials_4thDown %>% 
+  filter(play_id %in% pbp_all_Timeouts_Vector_PLUSONE)
+  
+pbp_all_NoSpecials_4thDownPlaysFollowingTimeout_VECTOR <- pbp_all_NoSpecials_4thDownPlaysFollowingTimeout$play_id
+
+## Create a set of fourth down plays that didn't come after timeouts
+pbp_all_NoSpecials_4thDownsNOTAfterTimeout <- pbp_all_NoSpecials_4thDown %>% filter(!play_id %in% pbp_all_NoSpecials_4thDownPlaysFollowingTimeout_VECTOR)
+
+## Compare the sets using success rate, EPA, etc.
+mean(pbp_all_NoSpecials_4thDownPlaysFollowingTimeout$fourth_down_converted)
+mean(pbp_all_NoSpecials_4thDownsNOTAfterTimeout$fourth_down_converted)
+t.test(pbp_all_NoSpecials_4thDownPlaysFollowingTimeout$fourth_down_converted, pbp_all_NoSpecials_4thDownsNOTAfterTimeout$fourth_down_converted)
+mean(pbp_all_NoSpecials_4thDownPlaysFollowingTimeout$epa)
+mean(pbp_all_NoSpecials_4thDownsNOTAfterTimeout$epa)
+t.test(pbp_all_NoSpecials_4thDownPlaysFollowingTimeout$epa, pbp_all_NoSpecials_4thDownsNOTAfterTimeout$epa)
+mean(pbp_all_NoSpecials_4thDownPlaysFollowingTimeout$wpa, na.rm = TRUE)
+mean(pbp_all_NoSpecials_4thDownsNOTAfterTimeout$wpa, na.rm = TRUE)
+t.test(pbp_all_NoSpecials_4thDownPlaysFollowingTimeout$wpa, pbp_all_NoSpecials_4thDownsNOTAfterTimeout$wpa)
+
+pbp_all_NoSpecials_4thDown <- pbp_all_NoSpecials_4thDown %>% 
+  mutate(RoughDist = ifelse(ydstogo <= 2, "Short", ifelse(ydstogo %in% 3:6, "Med", "Long")))
+
+pbp_all_NoSpecials_4thDown <- pbp_all_NoSpecials_4thDown %>%
+  mutate(PrecedTO = ifelse(play_id %in% pbp_all_NoSpecials_4thDownPlaysFollowingTimeout_VECTOR, 1, 0))
+
+## Get all the fourth downs and short (follow up with medium and long)
+pbp_all_ALL4thandshort <- pbp_all_NoSpecials_4thDown %>% 
+  filter(ydstogo %in% 1:2)
+pbp_all_4thandshort_NOTimeout <- pbp_all_NoSpecials_4thDownsNOTAfterTimeout %>% 
+  filter(ydstogo %in% 1:2)
+pbp_all_4thandshort_YESTimeout <- pbp_all_NoSpecials_4thDownPlaysFollowingTimeout %>% 
+  filter(ydstogo %in% 1:2)
+mean(pbp_all_4thandshort_YESTimeout$fourth_down_converted)
+mean(pbp_all_4thandshort_NOTimeout$fourth_down_converted)
+t.test(pbp_all_4thandshort_YESTimeout$fourth_down_converted, pbp_all_4thandshort_NOTimeout$fourth_down_converted)
+
+pbp_all_ALL4thandmed <- pbp_all_NoSpecials_4thDown %>% 
+  filter(ydstogo %in% 3:6)
+pbp_all_4thandmed_NOTimeout <- pbp_all_NoSpecials_4thDownsNOTAfterTimeout %>% 
+  filter(ydstogo %in% 3:6)
+pbp_all_4thandmed_YESTimeout <- pbp_all_NoSpecials_4thDownPlaysFollowingTimeout %>% 
+  filter(ydstogo %in% 3:6)
+mean(pbp_all_4thandmed_YESTimeout$fourth_down_converted)
+mean(pbp_all_4thandmed_NOTimeout$fourth_down_converted)
+t.test(pbp_all_4thandmed_YESTimeout$fourth_down_converted, pbp_all_4thandmed_NOTimeout$fourth_down_converted)
+
+pbp_all_ALL4thandlong <- pbp_all_NoSpecials_4thDown %>% 
+  filter(ydstogo >= 7)
+pbp_all_4thandlong_NOTimeout <- pbp_all_NoSpecials_4thDownsNOTAfterTimeout %>% 
+  filter(ydstogo >= 7)
+pbp_all_4thandlong_YESTimeout <- pbp_all_NoSpecials_4thDownPlaysFollowingTimeout %>% 
+  filter(ydstogo >= 7)
+mean(pbp_all_4thandlong_YESTimeout$fourth_down_converted)
+mean(pbp_all_4thandlong_NOTimeout$fourth_down_converted)
+t.test(pbp_all_4thandlong_YESTimeout$fourth_down_converted, pbp_all_4thandlong_NOTimeout$fourth_down_converted)
+
+FourthAndShortNoTimeoutSuccess <- mean(pbp_all_4thandshort_NOTimeout$fourth_down_converted)
+FourthAndShortYesTimeoutSuccess <- mean(pbp_all_4thandshort_YESTimeout$fourth_down_converted)
+FourthAndMedNoTimeoutSuccess <- mean(pbp_all_4thandmed_NOTimeout$fourth_down_converted)
+FourthAndMedYesTimeoutSuccess <- mean(pbp_all_4thandmed_YESTimeout$fourth_down_converted)
+FourthAndLongNoTimeoutSuccess <- mean(pbp_all_4thandlong_NOTimeout$fourth_down_converted)
+FourthAndLongYesTimeoutSuccess <- mean(pbp_all_4thandlong_YESTimeout$fourth_down_converted)
+ALLFourthDownSuccess <- mean(pbp_all_NoSpecials_4thDown$fourth_down_converted)
+
+FourthDownDistVec <- c(FourthAndShortNoTimeoutSuccess, FourthAndShortYesTimeoutSuccess,
+                       FourthAndMedNoTimeoutSuccess, FourthAndMedYesTimeoutSuccess,
+                       FourthAndLongNoTimeoutSuccess, FourthAndLongYesTimeoutSuccess)
+
+pbp_all_NoSpecials_4thDownPlaysFollowingTimeout <- pbp_all_NoSpecials_4thDownPlaysFollowingTimeout %>% 
+  mutate(PrecedTO = 1)
+pbp_all_NoSpecials_4thDownsNOTAfterTimeout <- pbp_all_NoSpecials_4thDownsNOTAfterTimeout %>% 
+  mutate(PrecedTO = 0)
+
+pbp_all_4thandlong_NOTimeout <- pbp_all_4thandlong_NOTimeout %>% mutate(PrecedTO = 0, RoughDist = "Long")
+pbp_all_4thandlong_YESTimeout <- pbp_all_4thandlong_YESTimeout %>% mutate(PrecedTO = 1, RoughDist = "Long")
+pbp_all_4thandmed_NOTimeout <- pbp_all_4thandmed_NOTimeout %>% mutate(PrecedTO = 0, RoughDist = "Med")
+pbp_all_4thandmed_YESTimeout <- pbp_all_4thandmed_YESTimeout %>% mutate(PrecedTO = 1, RoughDist = "Med")
+pbp_all_4thandshort_NOTimeout <- pbp_all_4thandshort_NOTimeout %>% mutate(PrecedTO = 0, RoughDist = "Short")
+pbp_all_4thandshort_YESTimeout <- pbp_all_4thandshort_YESTimeout %>% mutate(PrecedTO = 1, RoughDist = "Short")
+
+SE <- function(x){
+  mu <- mean(x, na.rm = TRUE)
+  return( sqrt( (mu*(1 - mu))/(length(x)) ) )
+}
+SE(pbp_all_4thandlong_NOTimeout$fourth_down_converted)
+
+ConfBand <- function(x) {
+  return(1.96*SE(x))
+}
+
+upper <- function(x) {
+  mean(x) + ConfBand(x)
+}
+
+lower <- function(x) {
+  mean(x) - ConfBand(x)
+}
+
+# PLOT 5 (don't worry about the numbering of the plots, that was for the Football Outsiders editors)
+UpperVec5 <- c(upper(pbp_all_4thandshort_NOTimeout$fourth_down_converted),
+              upper(pbp_all_4thandshort_YESTimeout$fourth_down_converted),
+              upper(pbp_all_4thandmed_NOTimeout$fourth_down_converted),
+              upper(pbp_all_4thandmed_YESTimeout$fourth_down_converted),
+              upper(pbp_all_4thandlong_NOTimeout$fourth_down_converted),
+              upper(pbp_all_4thandlong_YESTimeout$fourth_down_converted))
+
+LowerVec5 <- c(lower(pbp_all_4thandshort_NOTimeout$fourth_down_converted),
+               lower(pbp_all_4thandshort_YESTimeout$fourth_down_converted),
+               lower(pbp_all_4thandmed_NOTimeout$fourth_down_converted),
+               lower(pbp_all_4thandmed_YESTimeout$fourth_down_converted),
+               lower(pbp_all_4thandlong_NOTimeout$fourth_down_converted),
+               lower(pbp_all_4thandlong_YESTimeout$fourth_down_converted))
+
+## Try turning FourthDownTypeVec into a data frame, for graph purposes
+FourthDownDistDataFrame <- data.frame(SuccessRate = FourthDownDistVec, PrecedTO = c(0, 1, 0, 1, 0, 1),
+                                      RoughDist = c("Short", "Short", "Med", "Med", "Long", "Long"),
+                                      Upper = UpperVec5, Lower = LowerVec5)
+
+FourthDownDistDataFrame %>%
+  ggplot(aes(x = RoughDist, y = SuccessRate, fill = factor(PrecedTO),
+         ymin = Lower, ymax = Upper)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_hline(yintercept = ALLFourthDownSuccess, alpha = 0.75,
+             color = "darkgrey", linetype = "dashed") + 
+  annotate("text", 
+           label = glue("4th Down Avg: {scales::percent(ALLFourthDownSuccess)}"),
+           y = ALLFourthDownSuccess + 0.03, x = 1, size = 3) +
+  geom_errorbar(position = "dodge") +
+  labs(x = "Distance", y = "Success Rate",
+       title = "Success Rate on 4th Down by Distance and Preceding Timeout",
+       subtitle = "2009-2018 Seasons",
+       caption = "Data from nflscrapR",
+       fill = "Timeout Before?") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+pbp_all_NoSpecials_4thDown %>% group_by(RoughDist, PrecedTO) %>% 
+  summarize(n = n(), SuccessRate = mean(fourth_down_converted))
+
+## Next, look at passes vs. runs
+pbp_all_NoSpecials_4thDown_Passes <- pbp_all_NoSpecials_4thDown %>% filter(pass == 1)
+pbp_all_NoSpecials_4thDown_Runs <- pbp_all_NoSpecials_4thDown %>% filter(rush == 1)
+mean(pbp_all_NoSpecials_4thDown_Passes$fourth_down_converted)
+mean(pbp_all_NoSpecials_4thDown_Runs$fourth_down_converted)
+t.test(pbp_all_NoSpecials_4thDown_Passes$fourth_down_converted, pbp_all_NoSpecials_4thDown_Runs$fourth_down_converted)
+
+PASSFourthDownSuccess <- mean(pbp_all_NoSpecials_4thDown_Passes$fourth_down_converted)
+RUNSFourthDownSuccess <- mean(pbp_all_NoSpecials_4thDown_Runs$fourth_down_converted)
+  
+pbp_all_NoSpecials_4thDown_Passes_NOTimeout <- pbp_all_NoSpecials_4thDownsNOTAfterTimeout %>% 
+  filter(pass == 1)
+pbp_all_NoSpecials_4thDown_Passes_YESTimeout <- pbp_all_NoSpecials_4thDownPlaysFollowingTimeout %>% 
+  filter(pass == 1)
+pbp_all_NoSpecials_4thDown_Runs_NOTimeout <- pbp_all_NoSpecials_4thDownsNOTAfterTimeout %>% 
+  filter(rush == 1)
+pbp_all_NoSpecials_4thDown_Runs_YESTimeout <- pbp_all_NoSpecials_4thDownPlaysFollowingTimeout %>% 
+  filter(rush == 1)
+
+mean(pbp_all_NoSpecials_4thDown_Passes_NOTimeout$fourth_down_converted)
+mean(pbp_all_NoSpecials_4thDown_Passes_YESTimeout$fourth_down_converted)
+t.test(pbp_all_NoSpecials_4thDown_Passes_NOTimeout$fourth_down_converted, pbp_all_NoSpecials_4thDown_Passes_YESTimeout$fourth_down_converted)
+mean(pbp_all_NoSpecials_4thDown_Runs_NOTimeout$fourth_down_converted)
+mean(pbp_all_NoSpecials_4thDown_Runs_YESTimeout$fourth_down_converted)
+t.test(pbp_all_NoSpecials_4thDown_Runs_NOTimeout$fourth_down_converted, pbp_all_NoSpecials_4thDown_Runs_YESTimeout$fourth_down_converted)
+
+FourthDownPassNoTimeoutSuccess <- mean(pbp_all_NoSpecials_4thDown_Passes_NOTimeout$fourth_down_converted)
+FourthDownPassYesTimeoutSuccess <- mean(pbp_all_NoSpecials_4thDown_Passes_YESTimeout$fourth_down_converted)
+FourthDownRunsNoTimeoutSuccess <- mean(pbp_all_NoSpecials_4thDown_Runs_NOTimeout$fourth_down_converted)
+FourthDownRunsYesTimeoutSuccess <- mean(pbp_all_NoSpecials_4thDown_Runs_YESTimeout$fourth_down_converted)
+
+# PLOT 11
+UpperVec11 <- c(upper(pbp_all_NoSpecials_4thDown_Passes_NOTimeout$fourth_down_converted),
+               upper(pbp_all_NoSpecials_4thDown_Passes_YESTimeout$fourth_down_converted),
+               upper(pbp_all_NoSpecials_4thDown_Runs_NOTimeout$fourth_down_converted),
+               upper(pbp_all_NoSpecials_4thDown_Runs_YESTimeout$fourth_down_converted))
+
+LowerVec11 <- c(lower(pbp_all_NoSpecials_4thDown_Passes_NOTimeout$fourth_down_converted),
+               lower(pbp_all_NoSpecials_4thDown_Passes_YESTimeout$fourth_down_converted),
+               lower(pbp_all_NoSpecials_4thDown_Runs_NOTimeout$fourth_down_converted),
+               lower(pbp_all_NoSpecials_4thDown_Runs_YESTimeout$fourth_down_converted))
+
+FourthDownRunPassVec <- c(FourthDownPassNoTimeoutSuccess, FourthDownPassYesTimeoutSuccess,
+                          FourthDownRunsNoTimeoutSuccess, FourthDownRunsYesTimeoutSuccess)
+
+RunPassDataFrame <- data.frame(SuccessRate = FourthDownRunPassVec, PrecedTO = c(0, 1, 0, 1),
+                                                Play = c("Pass", "Pass", "Run", "Run"),
+                                            Upper = UpperVec11, Lower = LowerVec11)
+
+pbp_all_NoSpecials_4thDown %>% group_by(pass, PrecedTO) %>% 
+  summarize(n = n(), SuccessRate = mean(fourth_down_converted))
+
+RunPassDataFrame %>%
+  ggplot(aes(x = Play, y = SuccessRate, fill = factor(PrecedTO),
+             ymin = Lower, ymax = Upper)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_hline(yintercept = ALLFourthDownSuccess, alpha = 0.75,
+             color = "darkgrey", linetype = "dashed") + 
+  annotate("text", 
+           label = glue("4th Down Avg: {scales::percent(ALLFourthDownSuccess)}"),
+           y = ALLFourthDownSuccess + 0.03, x = 1, size = 3) +
+  geom_errorbar(position = "dodge") +
+  labs(x = "Distance", y = "Success Rate",
+       title = "Success Rate on 4th Down by Run/Pass and Preceding Timeout",
+       subtitle = "2009-2018 Seasons",
+       caption = "Data from nflscrapR",
+       fill = "Timeout Before?") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+## DO THIS FOR FOURTH AND SHORT PASSES vs. FOURTH AND SHORT RUNS
+pbp_all_4thandshort_Passes <- pbp_all_ALL4thandshort %>% 
+  filter(pass == 1)
+pbp_all_4thandshort_Runs <- pbp_all_ALL4thandshort %>% 
+  filter(rush == 1)
+pbp_all_4thandmed_Passes <- pbp_all_ALL4thandmed %>% 
+  filter(pass == 1)
+pbp_all_4thandmed_Runs <- pbp_all_ALL4thandmed %>% 
+  filter(rush == 1)
+pbp_all_4thandlong_Passes <- pbp_all_ALL4thandlong %>% 
+  filter(pass == 1)
+pbp_all_4thandlong_Runs <- pbp_all_ALL4thandlong %>% 
+  filter(rush == 1)
+
+pbp_all_4thandlong_Passes_NOTimeout <- pbp_all_4thandlong_NOTimeout %>% 
+  filter(pass == 1)
+pbp_all_4thandlong_Runs_NOTimeout <- pbp_all_4thandlong_NOTimeout %>% 
+  filter(rush == 1)
+pbp_all_4thandlong_Passes_YESTimeout <- pbp_all_4thandlong_YESTimeout %>% 
+  filter(pass == 1)
+pbp_all_4thandlong_Runs_YESTimeout <- pbp_all_4thandlong_YESTimeout %>% 
+  filter(rush == 1)
+pbp_all_4thandmed_Passes_NOTimeout <- pbp_all_4thandmed_NOTimeout %>% 
+  filter(pass == 1)
+pbp_all_4thandmed_Runs_NOTimeout <- pbp_all_4thandmed_NOTimeout %>% 
+  filter(rush == 1)
+pbp_all_4thandmed_Passes_YESTimeout <- pbp_all_4thandmed_YESTimeout %>% 
+  filter(pass == 1)
+pbp_all_4thandmed_Runs_YESTimeout <- pbp_all_4thandmed_YESTimeout %>% 
+  filter(rush == 1)
+pbp_all_4thandshort_Passes_NOTimeout <- pbp_all_4thandshort_NOTimeout %>% 
+  filter(pass == 1)
+pbp_all_4thandshort_Runs_NOTimeout <- pbp_all_4thandshort_NOTimeout %>% 
+  filter(rush == 1)
+pbp_all_4thandshort_Passes_YESTimeout <- pbp_all_4thandshort_YESTimeout %>% 
+  filter(pass == 1)
+pbp_all_4thandshort_Runs_YESTimeout <- pbp_all_4thandshort_YESTimeout %>% 
+  filter(rush == 1)
+
+pbp_all_NoSpecials_4thDown %>% group_by(RoughDist, pass, PrecedTO) %>% 
+  summarize(n = n(), SuccessRate = mean(fourth_down_converted))
+## EXTREMELY IMPORTANT, SUMMARIZES WHOLE PROJECT
+
+FourthandShortPassNoTimeoutSuccess <- mean(pbp_all_4thandshort_Passes_NOTimeout$fourth_down_converted)
+FourthandShortPassYesTimeoutSuccess <- mean(pbp_all_4thandshort_Passes_YESTimeout$fourth_down_converted)
+FourthandShortRunNoTimeoutSuccess <- mean(pbp_all_4thandshort_Runs_NOTimeout$fourth_down_converted)
+FourthandShortRunYesTimeoutSuccess <- mean(pbp_all_4thandshort_Runs_YESTimeout$fourth_down_converted)
+
+# PLOT 15
+FourthAndShortVec <- c(FourthandShortPassNoTimeoutSuccess, FourthandShortPassYesTimeoutSuccess,
+                       FourthandShortRunNoTimeoutSuccess, FourthandShortRunYesTimeoutSuccess)
+
+UpperVec15 <- c(upper(pbp_all_4thandshort_Passes_NOTimeout$fourth_down_converted),
+                upper(pbp_all_4thandshort_Passes_YESTimeout$fourth_down_converted),
+                upper(pbp_all_4thandshort_Runs_NOTimeout$fourth_down_converted),
+                upper(pbp_all_4thandshort_Runs_YESTimeout$fourth_down_converted))
+
+LowerVec15 <- c(lower(pbp_all_4thandshort_Passes_NOTimeout$fourth_down_converted),
+                lower(pbp_all_4thandshort_Passes_YESTimeout$fourth_down_converted),
+                lower(pbp_all_4thandshort_Runs_NOTimeout$fourth_down_converted),
+                lower(pbp_all_4thandshort_Runs_YESTimeout$fourth_down_converted))
+
+FourthAndShortDataFrame <- data.frame(SuccessRate = FourthAndShortVec, PrecedTO = c(0, 1, 0, 1),
+                                      Play = c("Pass", "Pass", "Run", "Run"),
+                                      Upper = UpperVec15, Lower = LowerVec15)
+
+FourthAndShortDataFrame %>%
+  ggplot(aes(x = Play, y = SuccessRate, fill = factor(PrecedTO),
+             ymin = Lower, ymax = Upper)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_errorbar(position = "dodge") +
+  labs(x = "Distance", y = "Success Rate",
+       title = "Success Rate on 4th and Short by Run/Pass and Preceding Timeout",
+       subtitle = "2009-2018 Seasons",
+       caption = "Data from nflscrapR",
+       fill = "Timeout Before?") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+mean(pbp_all_4thandshort_Passes_NOTimeout$fourth_down_converted)
+mean(pbp_all_4thandshort_Passes_YESTimeout$fourth_down_converted)
+t.test(pbp_all_4thandshort_Passes_NOTimeout$fourth_down_converted, pbp_all_4thandshort_Passes_YESTimeout$fourth_down_converted)
+## This results in p-value of 0.7718, don't bother including
+
+mean(pbp_all_4thandshort_Runs_NOTimeout$fourth_down_converted)
+mean(pbp_all_4thandshort_Runs_YESTimeout$fourth_down_converted)
+t.test(pbp_all_4thandshort_Runs_NOTimeout$fourth_down_converted, pbp_all_4thandshort_Runs_YESTimeout$fourth_down_converted)
+## p-value of 0.866, don't include
+
+FourthandMedPassNoTimeoutSuccess <- mean(pbp_all_4thandmed_Passes_NOTimeout$fourth_down_converted)
+FourthandMedPassYesTimeoutSuccess <- mean(pbp_all_4thandmed_Passes_YESTimeout$fourth_down_converted)
+FourthandMedRunNoTimeoutSuccess <- mean(pbp_all_4thandmed_Runs_NOTimeout$fourth_down_converted)
+FourthandMedRunYesTimeoutSuccess <- mean(pbp_all_4thandmed_Runs_YESTimeout$fourth_down_converted)
+
+FourthAndMedVec <- c(FourthandMedPassNoTimeoutSuccess, FourthandMedPassYesTimeoutSuccess,
+                       FourthandMedRunNoTimeoutSuccess, FourthandMedRunYesTimeoutSuccess)
+# PLOT 16
+UpperVec16 <- c(upper(pbp_all_4thandmed_Passes_NOTimeout$fourth_down_converted),
+                upper(pbp_all_4thandmed_Passes_YESTimeout$fourth_down_converted),
+                upper(pbp_all_4thandmed_Runs_NOTimeout$fourth_down_converted),
+                upper(pbp_all_4thandmed_Runs_YESTimeout$fourth_down_converted))
+
+LowerVec16 <- c(lower(pbp_all_4thandmed_Passes_NOTimeout$fourth_down_converted),
+                lower(pbp_all_4thandmed_Passes_YESTimeout$fourth_down_converted),
+                lower(pbp_all_4thandmed_Runs_NOTimeout$fourth_down_converted),
+                lower(pbp_all_4thandmed_Runs_YESTimeout$fourth_down_converted))
+
+FourthAndMedDataFrame <- data.frame(SuccessRate = FourthAndMedVec, PrecedTO = c(0, 1, 0, 1),
+                                      Play = c("Pass", "Pass", "Run", "Run"),
+                                      Upper = UpperVec16, Lower = LowerVec16)
+
+FourthAndMedDataFrame %>%
+  ggplot(aes(x = Play, y = SuccessRate, fill = factor(PrecedTO),
+             ymin = Lower, ymax = Upper)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_errorbar(position = "dodge") +
+  labs(x = "Distance", y = "Success Rate",
+       title = "Success Rate on 4th and Med by Run/Pass and Preceding Timeout",
+       subtitle = "2009-2018 Seasons",
+       caption = "Data from nflscrapR",
+       fill = "Timeout Before?") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+mean(pbp_all_4thandmed_Passes_NOTimeout$fourth_down_converted)
+mean(pbp_all_4thandmed_Passes_YESTimeout$fourth_down_converted)
+t.test(pbp_all_4thandmed_Passes_NOTimeout$fourth_down_converted, pbp_all_4thandmed_Passes_YESTimeout$fourth_down_converted)
+
+mean(pbp_all_4thandmed_Runs_NOTimeout$fourth_down_converted)
+mean(pbp_all_4thandmed_Runs_YESTimeout$fourth_down_converted)
+t.test(pbp_all_4thandmed_Runs_NOTimeout$fourth_down_converted, pbp_all_4thandmed_Runs_YESTimeout$fourth_down_converted)
+## Include this one
+
+FourthandLongPassNoTimeoutSuccess <- mean(pbp_all_4thandlong_Passes_NOTimeout$fourth_down_converted)
+FourthandLongPassYesTimeoutSuccess <- mean(pbp_all_4thandlong_Passes_YESTimeout$fourth_down_converted)
+FourthandLongRunNoTimeoutSuccess <- mean(pbp_all_4thandlong_Runs_NOTimeout$fourth_down_converted)
+FourthandLongRunYesTimeoutSuccess <- mean(pbp_all_4thandlong_Runs_YESTimeout$fourth_down_converted)
+
+FourthAndLongVec <- c(FourthandLongPassNoTimeoutSuccess, FourthandLongPassYesTimeoutSuccess,
+                     FourthandLongRunNoTimeoutSuccess, FourthandLongRunYesTimeoutSuccess)
+# PLOT 17
+UpperVec17 <- c(upper(pbp_all_4thandlong_Passes_NOTimeout$fourth_down_converted),
+                upper(pbp_all_4thandlong_Passes_YESTimeout$fourth_down_converted),
+                upper(pbp_all_4thandlong_Runs_NOTimeout$fourth_down_converted),
+                upper(pbp_all_4thandlong_Runs_YESTimeout$fourth_down_converted))
+
+LowerVec17 <- c(lower(pbp_all_4thandlong_Passes_NOTimeout$fourth_down_converted),
+                lower(pbp_all_4thandlong_Passes_YESTimeout$fourth_down_converted),
+                lower(pbp_all_4thandlong_Runs_NOTimeout$fourth_down_converted),
+                lower(pbp_all_4thandlong_Runs_YESTimeout$fourth_down_converted))
+
+FourthAndLongDataFrame <- data.frame(SuccessRate = FourthAndLongVec, PrecedTO = c(0, 1, 0, 1),
+                                    Play = c("Pass", "Pass", "Run", "Run"),
+                                    Upper = UpperVec17, Lower = LowerVec17)
+
+FourthAndLongDataFrame %>%
+  ggplot(aes(x = Play, y = SuccessRate, fill = factor(PrecedTO),
+             ymin = Lower, ymax = Upper)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_errorbar(position = "dodge") +
+  labs(x = "Distance", y = "Success Rate",
+       title = "Success Rate on 4th and Long by Run/Pass and Preceding Timeout",
+       subtitle = "2009-2018 Seasons",
+       caption = "Data from nflscrapR",
+       fill = "Timeout Before?") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+mean(pbp_all_4thandlong_Passes_NOTimeout$fourth_down_converted)
+mean(pbp_all_4thandlong_Passes_YESTimeout$fourth_down_converted)
+t.test(pbp_all_4thandlong_Passes_NOTimeout$fourth_down_converted, pbp_all_4thandlong_Passes_YESTimeout$fourth_down_converted)
+
+mean(pbp_all_4thandlong_Runs_NOTimeout$fourth_down_converted)
+mean(pbp_all_4thandlong_Runs_YESTimeout$fourth_down_converted)
+t.test(pbp_all_4thandlong_Runs_NOTimeout$fourth_down_converted, pbp_all_4thandlong_Runs_YESTimeout$fourth_down_converted)
+
+view(pbp_all_4thandlong_Runs_YESTimeout)
+view(pbp_all_4thandlong_Runs_NOTimeout)
+t.test(c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0), pbp_all_4thandlong_Runs_NOTimeout$fourth_down_converted)
+# This is the T-test if we removed intentional safeties/losses
+# for 4th and long runs, with timeouts
+
+# PLOT 22
+FourthAndShortNoTimeoutBigPlay <- mean(pbp_all_4thandshort_NOTimeout$BigPlay)
+FourthAndShortYesTimeoutBigPlay <- mean(pbp_all_4thandshort_YESTimeout$BigPlay)
+FourthAndMedNoTimeoutBigPlay <- mean(pbp_all_4thandmed_NOTimeout$BigPlay)
+FourthAndMedYesTimeoutBigPlay <- mean(pbp_all_4thandmed_YESTimeout$BigPlay)
+FourthAndLongNoTimeoutBigPlay <- mean(pbp_all_4thandlong_NOTimeout$BigPlay)
+FourthAndLongYesTimeoutBigPlay <- mean(pbp_all_4thandlong_YESTimeout$BigPlay)
+ALLFourthDownBigPlay <- mean(pbp_all_NoSpecials_4thDown$BigPlay)
+
+BigPlayAndDistVec <- c(FourthAndShortNoTimeoutBigPlay, FourthAndShortYesTimeoutBigPlay,
+                       FourthAndMedNoTimeoutBigPlay, FourthAndMedYesTimeoutBigPlay,
+                       FourthAndLongNoTimeoutBigPlay, FourthAndLongYesTimeoutBigPlay)
+
+UpperVec22 <- c(upper(pbp_all_4thandshort_NOTimeout$BigPlay),
+               upper(pbp_all_4thandshort_YESTimeout$BigPlay),
+               upper(pbp_all_4thandmed_NOTimeout$BigPlay),
+               upper(pbp_all_4thandmed_YESTimeout$BigPlay),
+               upper(pbp_all_4thandlong_NOTimeout$BigPlay),
+               upper(pbp_all_4thandlong_YESTimeout$BigPlay))
+
+LowerVec22 <- c(lower(pbp_all_4thandshort_NOTimeout$BigPlay),
+               lower(pbp_all_4thandshort_YESTimeout$BigPlay),
+               lower(pbp_all_4thandmed_NOTimeout$BigPlay),
+               lower(pbp_all_4thandmed_YESTimeout$BigPlay),
+               lower(pbp_all_4thandlong_NOTimeout$BigPlay),
+               lower(pbp_all_4thandlong_YESTimeout$BigPlay))
+
+BigPlayAndDistDataFrame <- data.frame(BigPlayRate = BigPlayAndDistVec, PrecedTO = c(0, 1, 0, 1, 0, 1),
+                                      RoughDist = c("Short", "Short", "Med", "Med", "Long", "Long"),
+                                      Upper = UpperVec22, Lower = LowerVec22)
+
+BigPlayAndDistDataFrame %>%
+  ggplot(aes(x = RoughDist, y = BigPlayRate, fill = factor(PrecedTO),
+             ymin = Lower, ymax = Upper)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_hline(yintercept = ALLFourthDownBigPlay, alpha = 0.75,
+             color = "darkgrey", linetype = "dashed") + 
+  annotate("text", 
+           label = glue("Big Play Avg: {scales::percent(ALLFourthDownBigPlay)}"),
+           y = ALLFourthDownBigPlay - 0.01, x = 1, size = 3) +
+  geom_errorbar(position = "dodge") +
+  labs(x = "Distance", y = "Big Play Rate",
+       title = "Big Play Rate on 4th Down by Distance and Preceding Timeout",
+       subtitle = "2009-2018 Seasons",
+       caption = "Data from nflscrapR",
+       fill = "Timeout Before?") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+mean(pbp_all_4thandshort_YESTimeout$BigPlay)
+mean(pbp_all_4thandshort_NOTimeout$BigPlay)
+t.test(pbp_all_4thandshort_YESTimeout$BigPlay, pbp_all_4thandshort_NOTimeout$BigPlay)
+
+mean(pbp_all_4thandshort_Runs_YESTimeout$BigPlay)
+mean(pbp_all_4thandshort_Runs_NOTimeout$BigPlay)
+t.test(pbp_all_4thandshort_Runs_YESTimeout$BigPlay, pbp_all_4thandshort_Runs_NOTimeout$BigPlay)
+
+mean(pbp_all_4thandshort_Runs_YESTimeout$yards_gained, na.rm = TRUE)
+mean(pbp_all_4thandshort_Runs_NOTimeout$yards_gained, na.rm = TRUE)
+t.test(pbp_all_4thandshort_Runs_YESTimeout$yards_gained, pbp_all_4thandshort_Runs_NOTimeout$yards_gained)
+
+mean(pbp_all_4thandshort_Runs_YESTimeout$yardline_100, na.rm = TRUE)
+mean(pbp_all_4thandshort_Runs_NOTimeout$yardline_100, na.rm = TRUE)
+t.test(pbp_all_4thandshort_Runs_YESTimeout$yardline_100, pbp_all_4thandshort_Runs_NOTimeout$yardline_100)
+
+mean(pbp_all_4thandshort_Passes_YESTimeout$BigPlay)
+mean(pbp_all_4thandshort_Passes_NOTimeout$BigPlay)
+t.test(pbp_all_4thandshort_Passes_YESTimeout$BigPlay, pbp_all_4thandshort_Passes_NOTimeout$BigPlay)
+
+pbp_all_NoSpecials_4thDown %>% group_by(RoughDist, pass, PrecedTO) %>% 
+  summarize(n = n(), BigPlayRate = mean(BigPlay))
