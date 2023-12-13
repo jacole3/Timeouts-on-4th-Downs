@@ -307,7 +307,7 @@ RunPassDataFrame %>%
            label = glue("4th Down Avg: {scales::percent(ALLFourthDownSuccess)}"),
            y = ALLFourthDownSuccess + 0.03, x = 1, size = 3) +
   geom_errorbar(position = "dodge") +
-  labs(x = "Distance", y = "Success Rate",
+  labs(x = "Play Type", y = "Success Rate",
        title = "Success Rate on 4th Down by Run/Pass and Preceding Timeout",
        subtitle = "2009-2018 Seasons",
        caption = "Data from nflscrapR",
@@ -386,7 +386,7 @@ FourthAndShortDataFrame %>%
              ymin = Lower, ymax = Upper)) +
   geom_bar(stat = "identity", position = "dodge") +
   geom_errorbar(position = "dodge") +
-  labs(x = "Distance", y = "Success Rate",
+  labs(x = "Play Type", y = "Success Rate",
        title = "Success Rate on 4th and Short by Run/Pass and Preceding Timeout",
        subtitle = "2009-2018 Seasons",
        caption = "Data from nflscrapR",
@@ -431,7 +431,7 @@ FourthAndMedDataFrame %>%
              ymin = Lower, ymax = Upper)) +
   geom_bar(stat = "identity", position = "dodge") +
   geom_errorbar(position = "dodge") +
-  labs(x = "Distance", y = "Success Rate",
+  labs(x = "Play Type", y = "Success Rate",
        title = "Success Rate on 4th and Med by Run/Pass and Preceding Timeout",
        subtitle = "2009-2018 Seasons",
        caption = "Data from nflscrapR",
@@ -475,7 +475,7 @@ FourthAndLongDataFrame %>%
              ymin = Lower, ymax = Upper)) +
   geom_bar(stat = "identity", position = "dodge") +
   geom_errorbar(position = "dodge") +
-  labs(x = "Distance", y = "Success Rate",
+  labs(x = "Play Type", y = "Success Rate",
        title = "Success Rate on 4th and Long by Run/Pass and Preceding Timeout",
        subtitle = "2009-2018 Seasons",
        caption = "Data from nflscrapR",
